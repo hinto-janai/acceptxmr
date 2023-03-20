@@ -9,6 +9,9 @@ Book](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field)
 
 ## [Unreleased]
 
+### Added
+- A batteries-included payment gateway built around the core library.
+
 ### Changed
 - Use webpki CA roots instead of native for better portability.
 
