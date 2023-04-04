@@ -10,63 +10,37 @@
 #![warn(clippy::cargo)]
 #![allow(clippy::module_name_repetitions)]
 
-use std::{
-    env,
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    task::Poll,
-    time::{Duration, Instant},
-};
+mod api;
+mod config;
+mod logging;
+mod websocket;
 
-use acceptxmr::{
-    storage::stores::Sqlite, Invoice, InvoiceId, PaymentGateway, PaymentGatewayBuilder, Subscriber,
-};
-use actix::{prelude::Stream, Actor, ActorContext, AsyncContext, StreamHandler};
-use actix_files::Files;
+use acceptxmr::{storage::stores::Sqlite, PaymentGatewayBuilder};
 use actix_session::{
-    config::CookieContentSecurity, storage::CookieSessionStore, Session, SessionMiddleware,
+    config::CookieContentSecurity, storage::CookieSessionStore, SessionMiddleware,
 };
-use actix_web::{
-    cookie, get,
-    http::header::{CacheControl, CacheDirective},
-    post, web,
-    web::Data,
-    App, HttpRequest, HttpResponse, HttpServer,
-};
-use actix_web_actors::ws;
-use bytestring::ByteString;
-use log::{debug, error, info, warn, LevelFilter};
+use actix_web::{cookie, web::Data, App, HttpServer};
+use log::{debug, error, info, warn};
 use rand::{thread_rng, Rng};
-use serde::Deserialize;
-use serde_json::json;
 
-/// Time before lack of client response causes a timeout.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Time between sending heartbeat pings.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+use crate::{
+    api::{external, internal},
+    config::read_config,
+    logging::init_logger,
+};
+
 /// Length in bytes of secure session key for cookies.
 const SESSION_KEY_LEN: usize = 64;
-/// Default invoice storage database directory.
-const DEFAULT_DB_DIR: &str = "AcceptXMR_DB/";
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::builder()
-        .filter_level(LevelFilter::Warn)
-        .filter_module("acceptxmr", log::LevelFilter::Debug)
-        .filter_module("acceptxmr-server", log::LevelFilter::Trace)
-        .init();
+    let config = read_config().unwrap();
+    init_logger(config.logging);
 
-    let mut db_dir = PathBuf::from(DEFAULT_DB_DIR.to_string());
-
-    // If not running in docker, try reading DB directory from environment.
-    if env::var("DOCKER") != Ok("true".to_string()) {
-        db_dir = PathBuf::from(env::var("DB_DIR").unwrap_or(DEFAULT_DB_DIR.to_string()));
-    };
-
-    std::fs::create_dir_all(&db_dir).expect("failed to create DB dir");
-    let db_path = db_dir
+    std::fs::create_dir_all(&config.database.path).expect("failed to create DB dir");
+    let db_path = config
+        .database
+        .path
         .canonicalize()
         .expect("could not determine absolute database path")
         .join("database");
@@ -135,200 +109,10 @@ async fn main() -> std::io::Result<()> {
                     .build(),
             )
             .app_data(shared_payment_gateway.clone())
-            .service(update)
-            .service(checkout)
-            .service(websocket)
-            .service(Files::new("", "./server/static").index_file("index.html"))
+            .configure(external)
+            .configure(internal)
     })
     .bind("0.0.0.0:8080")?
     .run()
     .await
-}
-
-#[derive(Deserialize)]
-struct CheckoutInfo {
-    message: String,
-}
-
-/// Create new invoice and place cookie.
-#[allow(clippy::unused_async)]
-#[post("/checkout")]
-async fn checkout(
-    session: Session,
-    checkout_info: web::Json<CheckoutInfo>,
-    payment_gateway: web::Data<PaymentGateway<Sqlite>>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let invoice_id = payment_gateway
-        .new_invoice(1_000_000_000, 2, 5, checkout_info.message.clone())
-        .unwrap();
-    session.insert("id", invoice_id)?;
-    Ok(HttpResponse::Ok()
-        .append_header(CacheControl(vec![CacheDirective::NoStore]))
-        .finish())
-}
-
-// Get invoice update without waiting for websocket.
-#[allow(clippy::unused_async)]
-#[get("/update")]
-async fn update(
-    session: Session,
-    payment_gateway: web::Data<PaymentGateway<Sqlite>>,
-) -> Result<HttpResponse, actix_web::Error> {
-    if let Ok(Some(invoice_id)) = session.get::<InvoiceId>("id") {
-        if let Ok(Some(invoice)) = payment_gateway.get_invoice(invoice_id) {
-            return Ok(HttpResponse::Ok()
-                .append_header(CacheControl(vec![CacheDirective::NoStore]))
-                .json(json!(
-                    {
-                        "address": invoice.address(),
-                        "amount_paid": invoice.amount_paid(),
-                        "amount_requested": invoice.amount_requested(),
-                        "uri": invoice.uri(),
-                        "confirmations": invoice.confirmations(),
-                        "confirmations_required": invoice.confirmations_required(),
-                        "expiration_in": invoice.expiration_in(),
-                    }
-                )));
-        };
-    }
-    Ok(HttpResponse::Gone()
-        .append_header(CacheControl(vec![CacheDirective::NoStore]))
-        .finish())
-}
-
-/// WebSocket rout.
-#[allow(clippy::unused_async)]
-#[get("/ws/")]
-async fn websocket(
-    session: Session,
-    req: HttpRequest,
-    stream: web::Payload,
-    payment_gateway: web::Data<PaymentGateway<Sqlite>>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let Ok(Some(invoice_id)) = session.get::<InvoiceId>("id") else {
-        return Ok(HttpResponse::NotFound()
-            .append_header(CacheControl(vec![CacheDirective::NoStore]))
-            .finish())
-    };
-    let Some(subscriber) = payment_gateway.subscribe(invoice_id) else {
-        return Ok(HttpResponse::NotFound()
-            .append_header(CacheControl(vec![CacheDirective::NoStore]))
-            .finish())
-    };
-    let websocket = WebSocket::new(subscriber);
-    ws::start(websocket, &req, stream)
-}
-
-/// Define websocket HTTP actor
-struct WebSocket {
-    last_heartbeat: Instant,
-    invoice_subscriber: Option<Subscriber>,
-}
-
-impl WebSocket {
-    fn new(invoice_subscriber: Subscriber) -> Self {
-        Self {
-            last_heartbeat: Instant::now(),
-            invoice_subscriber: Some(invoice_subscriber),
-        }
-    }
-
-    /// Sends ping to client every `HEARTBEAT_INTERVAL` and checks for responses
-    /// from client
-    fn heartbeat(ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            // check client heartbeats
-            if Instant::now().duration_since(act.last_heartbeat) > CLIENT_TIMEOUT {
-                // heartbeat timed out
-                warn!("Websocket Client heartbeat failed, disconnecting!");
-                ctx.stop();
-                return;
-            }
-            ctx.ping(b"");
-        });
-    }
-}
-
-impl Actor for WebSocket {
-    type Context = ws::WebsocketContext<Self>;
-
-    /// This method is called on actor start. We add the invoice subscriber as a
-    /// stream here, and start heartbeat checks as well.
-    fn started(&mut self, ctx: &mut Self::Context) {
-        if let Some(subscriber) = self.invoice_subscriber.take() {
-            <WebSocket as StreamHandler<Invoice>>::add_stream(InvoiceStream(subscriber), ctx);
-        }
-        Self::heartbeat(ctx);
-    }
-}
-
-/// Handle incoming websocket messages.
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocket {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Pong(_)) => {
-                self.last_heartbeat = Instant::now();
-            }
-            Ok(ws::Message::Close(reason)) => {
-                match &reason {
-                    Some(r) => debug!("Websocket client closing: {:#?}", r.description),
-                    None => debug!("Websocket client closing"),
-                }
-                ctx.close(reason);
-                ctx.stop();
-            }
-            Ok(m) => debug!("Received unexpected message from websocket client: {:?}", m),
-            Err(e) => warn!("Received error from websocket client: {:?}", e),
-        }
-    }
-}
-
-/// Handle incoming invoice updates.
-impl StreamHandler<Invoice> for WebSocket {
-    fn handle(&mut self, invoice_update: Invoice, ctx: &mut Self::Context) {
-        // Send the update to the user.
-        ctx.text(ByteString::from(
-            json!(
-                {
-                    "address": invoice_update.address(),
-                    "amount_paid": invoice_update.amount_paid(),
-                    "amount_requested": invoice_update.amount_requested(),
-                    "uri": invoice_update.uri(),
-                    "confirmations": invoice_update.confirmations(),
-                    "confirmations_required": invoice_update.confirmations_required(),
-                    "expiration_in": invoice_update.expiration_in(),
-                }
-            )
-            .to_string(),
-        ));
-        // If the invoice is confirmed or expired, stop checking for updates.
-        if invoice_update.is_confirmed() {
-            ctx.close(Some(ws::CloseReason::from((
-                ws::CloseCode::Normal,
-                "Invoice Complete",
-            ))));
-            ctx.stop();
-        } else if invoice_update.is_expired() {
-            ctx.close(Some(ws::CloseReason::from((
-                ws::CloseCode::Normal,
-                "Invoice Expired",
-            ))));
-            ctx.stop();
-        }
-    }
-}
-
-// Wrapping `Subscriber` and implementing `Stream` on the wrapper allows us to
-// use it as an efficient asynchronous stream for the Actix websocket.
-struct InvoiceStream(Subscriber);
-
-impl Stream for InvoiceStream {
-    type Item = Invoice;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0).poll(cx)
-    }
 }
